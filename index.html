@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <!-- viewport-fit=cover removed: it extends content into browser-chrome safe
+         areas (Chrome's translucent address bar), causing canvas top to render
+         under the URL bar. Default fit keeps canvas inside the visible viewport. -->
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="screen-orientation" content="portrait">
+    <title>Canyon Fall</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        /* Dark navy fallback (NOT white) so the HTML phase looks like the game
+           even before Unity loads. */
+        background: #0a1424;
+        -webkit-tap-highlight-color: transparent;
+        -webkit-touch-callout: none;
+        -webkit-user-select: none;
+        user-select: none;
+        touch-action: none;
+        overscroll-behavior: none;
+      }
+      #unity-container {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100svh;
+        /* Splash background: uses Unity's Player Settings → Splash Image →
+           Background, which Unity writes to "Build/build.jpg" during build.
+           If the file is missing the browser silently falls back to dark navy
+           — no broken-image icon. To override the bg, either change it in
+           Player Settings or drop a custom image at Build/build.jpg post-build. */
+        background: #0a1424 url('Build/build.jpg') center / cover no-repeat;
+      }
+      #unity-canvas {
+        width: 100% !important;
+        height: 100% !important;
+        display: block;
+        /* Canvas transparent until Unity paints — splash bg (from container)
+           shows through during the load phase instead of a white flash. */
+        background: transparent;
+        outline: none;
+      }
+      #unity-loading-bar {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        display: none;
+        text-align: center;
+        color: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      #unity-progress-bar-empty {
+        width: 60vw;
+        max-width: 320px;
+        height: 14px;
+        margin: 12px auto 0;
+        background: rgba(255,255,255,0.15);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      #unity-progress-bar-full {
+        width: 0%;
+        height: 100%;
+        background: #fff;
+        transition: width 0.15s ease;
+      }
+      #unity-warning {
+        position: absolute;
+        left: 50%;
+        top: 12px;
+        transform: translate(-50%, 0);
+        background: rgba(0,0,0,0.6);
+        color: #fff;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 13px;
+        display: none;
+        z-index: 10;
+      }
+      #rotate-overlay {
+        position: fixed;
+        inset: 0;
+        background: #000;
+        color: #fff;
+        z-index: 9999;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        text-align: center;
+        padding: 24px;
+      }
+      #rotate-overlay .icon {
+        font-size: 48px;
+        margin-bottom: 16px;
+        animation: rotate-hint 1.6s ease-in-out infinite;
+      }
+      @keyframes rotate-hint {
+        0%, 100% { transform: rotate(-90deg); }
+        50% { transform: rotate(0deg); }
+      }
+      @media (orientation: landscape) and (hover: none) and (pointer: coarse) {
+        #rotate-overlay { display: flex; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="unity-container">
+      <canvas id="unity-canvas" tabindex="-1"></canvas>
+      <div id="unity-loading-bar">
+        <div>Loading…</div>
+        <div id="unity-progress-bar-empty">
+          <div id="unity-progress-bar-full"></div>
+        </div>
+      </div>
+      <div id="unity-warning"></div>
+    </div>
+    <div id="rotate-overlay">
+      <div class="icon">⟳</div>
+      <div><strong>Please rotate your device</strong></div>
+      <div style="opacity:0.7;margin-top:8px;font-size:14px;">This game is best played in portrait mode.</div>
+    </div>
+
+    <!-- GameBull dependencies: socket.io-client (battle leaderboard) + qrcode-generator (battle QR) -->
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" crossorigin="anonymous"></script>
+
+    <script>
+      var container = document.querySelector("#unity-container");
+      var canvas = document.querySelector("#unity-canvas");
+      var loadingBar = document.querySelector("#unity-loading-bar");
+      var progressBarFull = document.querySelector("#unity-progress-bar-full");
+      var warningBanner = document.querySelector("#unity-warning");
+
+      function unityShowBanner(msg, type) {
+        warningBanner.innerHTML = msg;
+        warningBanner.style.display = "block";
+        if (type === 'error') warningBanner.style.background = "rgba(180,30,30,0.85)";
+        else if (type === 'warning') warningBanner.style.background = "rgba(180,140,30,0.85)";
+        setTimeout(function() { warningBanner.style.display = "none"; }, 5000);
+      }
+
+      var buildUrl = "Build";
+      var loaderUrl = buildUrl + "/build.loader.js";
+      var config = {
+        dataUrl: buildUrl + "/build.data",
+        frameworkUrl: buildUrl + "/build.framework.js",
+        codeUrl: buildUrl + "/build.wasm",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: "ASN Games",
+        productName: "Canyon Fall",
+        productVersion: "1.0",
+        showBanner: unityShowBanner,
+      };
+
+      var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      if (isMobile) {
+        var meta = document.querySelector('meta[name="viewport"]');
+        // Match the static <meta> above: viewport-fit=cover is INTENTIONALLY
+        // omitted so canvas doesn't render under Chrome mobile's translucent
+        // address bar.
+        if (meta) meta.setAttribute('content', 'width=device-width, height=device-height, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no');
+        config.devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      }
+
+      loadingBar.style.display = "block";
+
+      var script = document.createElement("script");
+      script.src = loaderUrl;
+      script.onload = function () {
+        createUnityInstance(canvas, config, function (progress) {
+          progressBarFull.style.width = (100 * progress) + "%";
+        }).then(function (unityInstance) {
+          loadingBar.style.display = "none";
+          window.unityInstance = unityInstance;
+        }).catch(function (message) {
+          alert(message);
+        });
+      };
+      document.body.appendChild(script);
+
+      // SIMPLE: trust CSS (100svh) to keep the container inside the visible
+      // viewport. JS only matches the canvas to the container's current rendered
+      // size. No visualViewport math, no position tweaks — those caused
+      // oscillation as the address bar appeared/disappeared.
+      function resizeCanvas() {
+        var w = container.clientWidth;
+        var h = container.clientHeight;
+        canvas.style.width  = w + 'px';
+        canvas.style.height = h + 'px';
+      }
+      window.addEventListener('resize',            resizeCanvas);
+      window.addEventListener('orientationchange', function () { setTimeout(resizeCanvas, 200); });
+      // Resize once now and once more after first paint settles.
+      resizeCanvas();
+      setTimeout(resizeCanvas, 100);
+      window.addEventListener('load', function () { setTimeout(resizeCanvas, 100); });
+
+      document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
+      document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    </script>
+  </body>
+</html>
